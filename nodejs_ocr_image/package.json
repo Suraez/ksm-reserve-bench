@@ -1,0 +1,9 @@
+{
+    "name": "nodejs-ocr-image-openwhisk",
+    "version": "1.0.0",
+    "main": "app.js",
+    "license": "MIT",
+    "dependencies": {
+      "tesseractocr": "^2.0.3"
+    }
+  }
