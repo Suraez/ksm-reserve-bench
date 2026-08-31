@@ -5,11 +5,11 @@ import tempfile
 import traceback
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-INIT_DONE = False
+DEFAULT_VIDEO_FILENAME = "hi_chitanda_eru.mp4"
+DEFAULT_IMAGE_FILENAME = "watermark.png"
+DEFAULT_LOCAL_PATH = "/action"
 
-IMAGE_NAME = "watermark.png"
-VIDEO_NAME = "hi_chitanda_eru.mp4"
-LOCAL_PATH = "/action"
+INIT_DONE = False
 
 
 def call_ffmpeg(args):
@@ -25,16 +25,16 @@ def call_ffmpeg(args):
         raise RuntimeError(f"ffmpeg failed: {ret.stdout}")
 
 
-def to_video(duration: int, local_path: str):
-    input_video = os.path.join(local_path, VIDEO_NAME)
-    input_image = os.path.join(local_path, IMAGE_NAME)
-    output = "processed_hi_chitanda_eru.mp4"
-    output_path = os.path.join(tempfile.gettempdir(), output)
+def require_file(path: str, label: str):
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f"Required {label} file not found: {path}")
 
-    if not os.path.isfile(input_video):
-        raise FileNotFoundError(f"Video file not found: {input_video}")
-    if not os.path.isfile(input_image):
-        raise FileNotFoundError(f"Image file not found: {input_image}")
+
+def to_video(duration: int, input_video: str, input_image: str, output_name: str):
+    require_file(input_video, "video")
+    require_file(input_image, "image")
+
+    output_path = os.path.join(tempfile.gettempdir(), output_name)
 
     if os.path.exists(output_path):
         os.remove(output_path)
@@ -51,29 +51,40 @@ def to_video(duration: int, local_path: str):
         "[v2][v3]overlay=eof_action=repeat[v4];"
         "[v4]drawbox=50:50:120:120:red:t=5[v5]",
         "-map", "[v5]",
-        output_path
+        output_path,
     ])
 
+    return output_path
+
+
+def run_action(params):
+    video_filename = params.get("video_filename", DEFAULT_VIDEO_FILENAME)
+    image_filename = params.get("image_filename", DEFAULT_IMAGE_FILENAME)
+    local_path = params.get("local_path", DEFAULT_LOCAL_PATH)
+    duration = int(params.get("duration", 5))
+    keep_output = bool(params.get("keep_output", True))
+
+    input_video = os.path.join(local_path, video_filename)
+    input_image = os.path.join(local_path, image_filename)
+
+    video_base = os.path.splitext(os.path.basename(video_filename))[0]
+    output_name = f"processed_{video_base}.mp4"
+
+    output_path = to_video(duration, input_video, input_image, output_name)
     output_size = os.path.getsize(output_path)
 
-    return {
-        "result": f"Video {output} finished!",
-        "output_name": output,
+    response = {
+        "result": f"Video {video_filename}+{image_filename} finished!",
+        "input_video": input_video,
+        "input_image": input_image,
+        "output_name": output_name,
         "output_path": output_path,
         "output_size_bytes": output_size,
         "output_size_mib": round(output_size / (1024 * 1024), 2),
     }
 
-
-def run_action(params):
-    duration = int(params.get("duration", 5))
-    keep_output = bool(params.get("keep_output", True))
-    local_path = params.get("local_path", LOCAL_PATH)
-
-    response = to_video(duration, local_path)
-
-    if not keep_output and os.path.exists(response["output_path"]):
-        os.remove(response["output_path"])
+    if not keep_output and os.path.exists(output_path):
+        os.remove(output_path)
         response["output_removed"] = True
     else:
         response["output_removed"] = False
