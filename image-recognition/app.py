@@ -1,7 +1,13 @@
+
+import ctypes
+import gc
 import json
 import os
 import re
+import socket
+import threading
 import traceback
+
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import urlparse
 
@@ -11,7 +17,18 @@ from PIL import Image
 from torchvision import transforms
 from torchvision.models import resnet50
 
+
+torch.set_num_threads(1)
+
 INIT_DONE = False
+
+CONTROL_SOCKET = "/control/invoke.sock"
+ENABLE_HTTP = os.environ.get("IMAGE_ENABLE_HTTP", "1") == "1"
+
+
+# ============================================================
+# Original Image Recognition configuration
+# ============================================================
 
 DEFAULT_IMAGE_NAME = "tesla.jpg"
 DEFAULT_IMAGE_URL = (
@@ -42,11 +59,40 @@ model = None
 idx2label = None
 
 
+# ============================================================
+# libc setup: malloc_trim only
+#
+# KSM eligibility is enabled by ksm_wrap.c using:
+# prctl(PR_SET_MEMORY_MERGE, 1, 0, 0, 0)
+# ============================================================
+
+libc = ctypes.CDLL("libc.so.6", use_errno=True)
+
+libc.malloc_trim.argtypes = [ctypes.c_size_t]
+libc.malloc_trim.restype = ctypes.c_int
+
+
+# ============================================================
+# Memory purging
+# ============================================================
+
+def purge_memory():
+
+    collected = gc.collect()
+    trimmed = libc.malloc_trim(0)
+
+    return {
+        "gc_collected": collected,
+        "malloc_trim_result": trimmed
+    }
+
+
+# ============================================================
+# File handling
+# ============================================================
+
 def safe_filename(filename: str, default: str = "input.jpg") -> str:
-    """
-    Prevent paths like ../../etc/passwd from being used as filenames.
-    Keeps only simple filename characters.
-    """
+
     if not filename:
         return default
 
@@ -60,123 +106,176 @@ def safe_filename(filename: str, default: str = "input.jpg") -> str:
 
 
 def infer_filename_from_url(url: str, default: str = "input.jpg") -> str:
+
     try:
         parsed = urlparse(url)
         candidate = os.path.basename(parsed.path)
+
         return safe_filename(candidate, default)
+
     except Exception:
         return default
 
 
-def download(url: str, directory: str, filename: str, overwrite: bool = False) -> str:
-    """
-    Download a file into directory/filename.
+# ============================================================
+# Download and close HTTP connection
+#
+# Important for CRIU checkpointing:
+# Do not retain unnecessary TCP connections after downloads.
+# ============================================================
 
-    By default, cached files are reused.
-    If overwrite=True, the file is downloaded again.
-    """
+def download(url, directory, filename, overwrite=False):
+
     os.makedirs(directory, exist_ok=True)
 
     filename = safe_filename(filename)
     path = os.path.join(directory, filename)
 
     if overwrite or not os.path.isfile(path):
-        response = requests.get(url, timeout=60)
-        response.raise_for_status()
 
-        with open(path, "wb") as f:
-            f.write(response.content)
+        with requests.get(
+            url,
+            timeout=60,
+            stream=True
+        ) as response:
+
+            response.raise_for_status()
+
+            with open(path, "wb") as f:
+
+                for chunk in response.iter_content(
+                    chunk_size=1024 * 1024
+                ):
+                    if chunk:
+                        f.write(chunk)
 
     return path
 
 
+# ============================================================
+# Load ImageNet labels once
+# ============================================================
+
 def ensure_labels():
+
     global idx2label
 
     if idx2label is None:
+
         dataset_path = download(
             DATASET_URL,
             LOCAL_PATH,
             DATASET_NAME,
-            overwrite=False,
+            overwrite=False
         )
 
         with open(dataset_path, "r") as f:
             class_idx = json.load(f)
 
-        idx2label = [class_idx[str(k)][1] for k in range(len(class_idx))]
+        idx2label = [
+            class_idx[str(k)][1]
+            for k in range(len(class_idx))
+        ]
+
+        del class_idx
 
     return idx2label
 
 
+# ============================================================
+# Load ResNet50 once
+# ============================================================
+
 def ensure_model():
+
     global model
 
     if model is None:
+
         model_path = download(
             MODEL_URL,
             LOCAL_PATH,
             MODEL_NAME,
-            overwrite=False,
+            overwrite=False
         )
 
-        model = resnet50(pretrained=False)
-        state_dict = torch.load(model_path, map_location="cpu")
-        model.load_state_dict(state_dict)
-        model.eval()
+        loaded_model = resnet50(pretrained=False)
+
+        state_dict = torch.load(
+            model_path,
+            map_location="cpu"
+        )
+
+        loaded_model.load_state_dict(state_dict)
+        loaded_model.eval()
+
+        # The model now owns the loaded parameters.
+        del state_dict
+
+        model = loaded_model
 
     return model
 
 
-def get_image_from_params(params: dict) -> tuple[str, str, str]:
-    """
-    Reads runtime input.
+# ============================================================
+# Get image input
+# ============================================================
 
-    Supported input:
-    {
-      "value": {
-        "image_url": "https://example.com/cat.jpg",
-        "image_name": "cat.jpg"
-      }
-    }
+def get_image_from_params(params):
 
-    image_name is optional.
-    If omitted, it is inferred from the URL.
-    """
-
-    image_url = params.get("image_url", DEFAULT_IMAGE_URL)
+    image_url = params.get(
+        "image_url",
+        DEFAULT_IMAGE_URL
+    )
 
     image_name = params.get("image_name")
+
     if not image_name:
-        image_name = infer_filename_from_url(image_url, DEFAULT_IMAGE_NAME)
+        image_name = infer_filename_from_url(
+            image_url,
+            DEFAULT_IMAGE_NAME
+        )
 
-    image_name = safe_filename(image_name, DEFAULT_IMAGE_NAME)
+    image_name = safe_filename(
+        image_name,
+        DEFAULT_IMAGE_NAME
+    )
 
-    # For user-provided runtime images, use /tmp so input files are not baked into the image.
-    # For the default image, also using /tmp is fine.
     image_path = download(
         image_url,
         INPUT_CACHE_PATH,
         image_name,
-        overwrite=params.get("overwrite", False),
+        overwrite=params.get("overwrite", False)
     )
 
     return image_path, image_url, image_name
 
 
+# ============================================================
+# Original Image Recognition benchmark
+# ============================================================
+
 def run_action(params):
+
     if params is None:
         params = {}
 
     if not isinstance(params, dict):
-        raise ValueError("Request value must be a JSON object")
+        raise ValueError(
+            "Request value must be a JSON object"
+        )
 
+    # Load and retain these across warm invocations.
     labels = ensure_labels()
     current_model = ensure_model()
 
-    image_path, request_image_url, request_image_name = get_image_from_params(params)
+    image_path, request_image_url, request_image_name = (
+        get_image_from_params(params)
+    )
 
-    input_image = Image.open(image_path).convert("RGB")
+    # Explicitly close the input image file.
+    with Image.open(image_path) as img:
+        input_image = img.convert("RGB")
 
     preprocess = transforms.Compose(
         [
@@ -194,14 +293,18 @@ def run_action(params):
     input_batch = input_tensor.unsqueeze(0)
 
     with torch.no_grad():
+
         output = current_model(input_batch)
         _, index = torch.max(output, 1)
 
     prediction_index = int(index.item())
     prediction_label = labels[prediction_index]
 
-    return {
-        "result": f"Prediction: index {prediction_index}, class {prediction_label}",
+    result = {
+        "result": (
+            f"Prediction: index {prediction_index}, "
+            f"class {prediction_label}"
+        ),
         "prediction_index": prediction_index,
         "prediction_label": prediction_label,
         "image_name": request_image_name,
@@ -211,20 +314,80 @@ def run_action(params):
         "dataset_name": DATASET_NAME,
     }
 
+    # ========================================================
+    # Release invocation-created objects
+    #
+    # Do not delete the global model or labels.
+    # They must remain warm for CRIU checkpointing.
+    # ========================================================
+
+    del output
+    del index
+    del input_batch
+    del input_tensor
+    del input_image
+    del preprocess
+
+    # ========================================================
+    # Purge reclaimable memory after inference
+    # ========================================================
+
+    result["purge"] = purge_memory()
+
+    return result
+
+
+# ============================================================
+# Accept direct and OpenWhisk-style requests
+# ============================================================
+
+def execute_event(event):
+
+    if not isinstance(event, dict):
+        raise ValueError(
+            "Invocation must be a JSON object"
+        )
+
+    params = event.get("value", event)
+
+    if not isinstance(params, dict):
+        raise ValueError(
+            "Invocation parameters must be a JSON object"
+        )
+
+    return run_action(params)
+
+
+# ============================================================
+# Existing HTTP/OpenWhisk server
+# ============================================================
 
 class OpenWhiskHandler(BaseHTTPRequestHandler):
+
     def _send_json(self, code, payload):
+
         body = json.dumps(payload).encode("utf-8")
 
         self.send_response(code)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
 
+        self.send_header(
+            "Content-Type",
+            "application/json"
+        )
+
+        self.send_header(
+            "Content-Length",
+            str(len(body))
+        )
+
+        self.end_headers()
         self.wfile.write(body)
 
     def _read_json(self):
-        length = int(self.headers.get("Content-Length", "0"))
+
+        length = int(
+            self.headers.get("Content-Length", "0")
+        )
 
         if length == 0:
             return {}
@@ -237,69 +400,207 @@ class OpenWhiskHandler(BaseHTTPRequestHandler):
         return json.loads(raw)
 
     def do_POST(self):
+
         global INIT_DONE
 
         try:
-            if self.path == "/init":
-                _ = self._read_json()
 
-                # Optional warm-up: load model and labels during init.
+            if self.path == "/init":
+
+                self._read_json()
+
                 ensure_labels()
                 ensure_model()
 
                 INIT_DONE = True
+
                 self._send_json(
                     200,
                     {
                         "ok": True,
                         "init_done": INIT_DONE,
-                        "message": "Model and labels loaded",
-                    },
+                        "message": "Model and labels loaded"
+                    }
                 )
+
                 return
 
             if self.path == "/run":
+
                 payload = self._read_json()
 
-                # Supports both:
-                # { "value": { "image_url": "...", "image_name": "..." } }
-                # and:
-                # { "image_url": "...", "image_name": "..." }
-                params = payload.get("value", payload)
+                result = execute_event(payload)
 
-                result = run_action(params)
                 self._send_json(200, result)
                 return
 
-            self._send_json(404, {"error": "not found"})
+            self._send_json(
+                404,
+                {"error": "not found"}
+            )
 
         except Exception as exc:
+
             self._send_json(
                 502,
                 {
                     "error": str(exc),
-                    "traceback": traceback.format_exc(),
-                },
+                    "traceback": traceback.format_exc()
+                }
             )
 
     def do_GET(self):
+
         if self.path == "/health":
+
             self._send_json(
                 200,
                 {
                     "status": "ok",
                     "init_done": INIT_DONE,
-                },
+                    "model_loaded": model is not None
+                }
             )
+
             return
 
-        self._send_json(404, {"error": "not found"})
+        self._send_json(
+            404,
+            {"error": "not found"}
+        )
 
     def log_message(self, format, *args):
         return
 
 
+# ============================================================
+# Unix-domain control server
+#
+# Used for runc + CRIU warm-parent cloning.
+#
+# Each restored clone has its own host-side control directory,
+# but inside the container the socket remains:
+#
+# /control/invoke.sock
+# ============================================================
+
+def unix_control_server():
+
+    os.makedirs(
+        os.path.dirname(CONTROL_SOCKET),
+        exist_ok=True
+    )
+
+    # Remove a stale socket file at fresh startup.
+    try:
+        os.unlink(CONTROL_SOCKET)
+    except FileNotFoundError:
+        pass
+
+    server = socket.socket(
+        socket.AF_UNIX,
+        socket.SOCK_STREAM
+    )
+
+    server.bind(CONTROL_SOCKET)
+
+    os.chmod(CONTROL_SOCKET, 0o666)
+
+    server.listen(1)
+
+    print(
+        "Unix control server listening on {}".format(
+            CONTROL_SOCKET
+        ),
+        flush=True
+    )
+
+    while True:
+
+        conn, _ = server.accept()
+
+        try:
+
+            # Client sends: <JSON>\n
+            # Server returns: <JSON>\n
+
+            chunks = []
+
+            while True:
+
+                data = conn.recv(65536)
+
+                if not data:
+                    break
+
+                chunks.append(data)
+
+                if b"\n" in data:
+                    break
+
+            request = b"".join(chunks)
+            request = request.split(b"\n", 1)[0]
+
+            event = json.loads(
+                request.decode("utf-8")
+            )
+
+            # Execute ResNet50 in this restored process.
+            result = execute_event(event)
+
+            response = (
+                json.dumps(result) + "\n"
+            ).encode("utf-8")
+
+            conn.sendall(response)
+
+        except Exception as exc:
+
+            response = (
+                json.dumps({
+                    "error": str(exc),
+                    "traceback": traceback.format_exc()
+                }) + "\n"
+            ).encode("utf-8")
+
+            try:
+                conn.sendall(response)
+            except OSError:
+                pass
+
+        finally:
+            conn.close()
+
+
+# ============================================================
+# Start servers
+# ============================================================
+
 if __name__ == "__main__":
-    server = HTTPServer(("0.0.0.0", 8080), OpenWhiskHandler)
-    print("Listening on 0.0.0.0:8080", flush=True)
-    server.serve_forever()
+
+    control_thread = threading.Thread(
+        target=unix_control_server,
+        daemon=True
+    )
+
+    control_thread.start()
+
+    if ENABLE_HTTP:
+
+        server = HTTPServer(
+            ("0.0.0.0", 8080),
+            OpenWhiskHandler
+        )
+
+        print(
+            "Image Recognition HTTP server "
+            "listening on port 8080",
+            flush=True
+        )
+
+        server.serve_forever()
+
+    else:
+
+        # Unix-only mode for native runc clones.
+        control_thread.join()

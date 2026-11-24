@@ -1,3 +1,4 @@
+
 FROM python:3.11-slim
 
 WORKDIR /action
@@ -12,6 +13,8 @@ COPY ksm_wrap.c .
 COPY acmart-master /action/acmart-master
 
 RUN gcc -O2 -o /usr/local/bin/ksm_wrap /action/ksm_wrap.c
+
+ENV COMPRESSION_ENABLE_HTTP=0
 
 EXPOSE 8080
 

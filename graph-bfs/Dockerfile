@@ -1,3 +1,4 @@
+
 FROM python:3.11-slim
 
 WORKDIR /action
@@ -14,6 +15,8 @@ COPY app.py .
 COPY ksm_wrap.c .
 
 RUN gcc -O2 -o /usr/local/bin/ksm_wrap /action/ksm_wrap.c
+
+ENV BFS_ENABLE_HTTP=0
 
 EXPOSE 8080
 

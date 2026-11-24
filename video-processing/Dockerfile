@@ -1,3 +1,4 @@
+
 FROM python:3.11-slim
 
 WORKDIR /action
@@ -14,6 +15,8 @@ COPY watermark.png .
 COPY hi_chitanda_eru.mp4 .
 
 RUN gcc -O2 -o /usr/local/bin/ksm_wrap /action/ksm_wrap.c
+
+ENV VP_ENABLE_HTTP=0
 
 EXPOSE 8080
 
